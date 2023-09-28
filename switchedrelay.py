@@ -17,8 +17,6 @@ import tornado.ioloop
 import tornado.web
 import tornado.options
 
-from tornado.concurrent import return_future
-
 from tornado import websocket
 
 
@@ -32,8 +30,7 @@ logger = logging.getLogger('relay')
 
 macmap = {}
 
-@return_future
-def delay_future(t, callback):
+async def delay_future(t, callback):
     timestamp = time.time()
     if timestamp < t:
         return
@@ -65,11 +62,11 @@ class TunThread(threading.Thread):
                         buf = self.tun.read(self.tun.mtu+18) #MTU doesn't include header or CRC32
                         if len(buf):
                             mac = buf[0:6]
-                            if mac == BROADCAST or (ord(mac[0]) & 0x1) == 1:
+                            if mac == BROADCAST or (mac[0] & 0x1) == 1:
                                 for socket in macmap.values():
                                     def send_message(socket):
                                         try:
-                                            socket.rate_limited_downstream(str(buf))
+                                            socket.rate_limited_downstream(buf)
                                         except:
                                             pass
 
@@ -78,12 +75,13 @@ class TunThread(threading.Thread):
                             elif macmap.get(mac, False):
                                 def send_message():
                                     try:
-                                        macmap[mac].rate_limited_downstream(str(buf))
+                                        macmap[mac].rate_limited_downstream(buf)
                                     except:
                                         pass
 
                                 loop.add_callback(send_message)
-        except:
+        except Exception as e:
+            raise e
             logger.error('closing due to tun error')
         finally:
             self.tun.close()
@@ -101,14 +99,19 @@ class MainHandler(websocket.WebSocketHandler):
         self.upstream = RateLimitingState(RATE, name='upstream', clientip=self.remote_ip)
         self.downstream = RateLimitingState(RATE, name='downstream', clientip=self.remote_ip)
 
-        ping_future = delay_future(time.time()+PING_INTERVAL, self.do_ping)
-        loop.add_future(ping_future, lambda: None)
+        # ping_future = delay_future(time.time()+PING_INTERVAL, self.do_ping)
+        # loop.add_future(ping_future, lambda: None)
+        # self.do_ping(time.time())
+
+    def check_origin(self, origin):
+        return True
+
 
     def do_ping(self, timestamp):
         self.ping(str(timestamp))
 
-        ping_future = delay_future(time.time()+PING_INTERVAL, self.do_ping)
-        loop.add_future(ping_future, lambda: None)
+        # ping_future = delay_future(time.time()+PING_INTERVAL, self.do_ping)
+        # loop.add_future(ping_future, lambda: None)
 
     def on_pong(self, data):
         pass
@@ -129,14 +132,14 @@ class MainHandler(websocket.WebSocketHandler):
                 del macmap[self.mac]
 
             self.mac = message[6:12]
-            formatted_mac = ':'.join('{0:02x}'.format(ord(a)) for a in message[6:12]) 
+            formatted_mac = ':'.join('{0:02x}'.format(a) for a in message[6:12]) 
             logger.info('%s: using mac %s' % (self.remote_ip, formatted_mac))
 
             macmap[self.mac] = self
 
         dest = message[0:6]
         try:
-            if dest == BROADCAST or (ord(dest[0]) & 0x1) == 1:
+            if dest == BROADCAST or (dest[0] & 0x1) == 1:
                 if self.upstream.do_throttle(message):
                     for socket in macmap.values():
                         try:
@@ -183,7 +186,7 @@ if __name__ == '__main__':
  
     args = sys.argv
     tornado.options.parse_command_line(args)
-    application.listen(80)
+    application.listen(8080)
     loop = tornado.ioloop.IOLoop.instance()
     try:
         loop.start()
