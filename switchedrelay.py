@@ -13,11 +13,10 @@ from pytun import TunTapDevice, IFF_TAP, IFF_NO_PI
 
 from limiter import RateLimitingState
 
-import tornado.ioloop
-import tornado.web
-import tornado.options
+import asyncio
+import aio_pika
 
-from tornado import websocket
+import json
 
 
 FORMAT = '%(asctime)-15s %(message)s'
@@ -55,11 +54,10 @@ class TunThread(threading.Thread):
         p.register(self.tun, POLLIN)
         try:
             while(self.running):
-                #TODO: log IP headers in the future
                 pollret = p.poll(1000)
                 for (f,e) in pollret:
                     if f == self.tun.fileno() and (e & POLLIN):
-                        buf = self.tun.read(self.tun.mtu+18) #MTU doesn't include header or CRC32
+                        buf = self.tun.read(self.tun.mtu+18)
                         if len(buf):
                             mac = buf[0:6]
                             if mac == BROADCAST or (mac[0] & 0x1) == 1:
@@ -70,7 +68,7 @@ class TunThread(threading.Thread):
                                         except:
                                             pass
 
-                                    loop.add_callback(functools.partial(send_message, socket))
+                                    # loop.add_callback(functools.partial(send_message, socket))
 
                             elif macmap.get(mac, False):
                                 def send_message():
@@ -79,7 +77,7 @@ class TunThread(threading.Thread):
                                     except:
                                         pass
 
-                                loop.add_callback(send_message)
+                                # loop.add_callback(send_message)
         except Exception as e:
             raise e
             logger.error('closing due to tun error')
@@ -87,111 +85,104 @@ class TunThread(threading.Thread):
             self.tun.close()
 
 
-class MainHandler(websocket.WebSocketHandler):
-    def __init__(self, *args, **kwargs):
-        super(MainHandler, self).__init__(*args,**kwargs)
-        self.remote_ip = self.request.headers.get('X-Forwarded-For', self.request.remote_ip)
+class RabbitMQConsumer:
+    def __init__(self, host, queue_name):
+        self.host = host
+        self.queue_name = queue_name
+
+        # self.remote_ip = self.request.headers.get('X-Forwarded-For', self.request.remote_ip)
+        self.remote_ip = '127.0.0.1'
         logger.info('%s: connected.' % self.remote_ip)
         self.thread = None
         self.mac = ''
-        self.allowance = RATE #unit: messages
-        self.last_check = time.time() #floating-point, e.g. usec accuracy. Unit: seconds
+        self.allowance = RATE
+        self.last_check = time.time()
         self.upstream = RateLimitingState(RATE, name='upstream', clientip=self.remote_ip)
         self.downstream = RateLimitingState(RATE, name='downstream', clientip=self.remote_ip)
 
-        # ping_future = delay_future(time.time()+PING_INTERVAL, self.do_ping)
-        # loop.add_future(ping_future, lambda: None)
-        # self.do_ping(time.time())
+    async def start(self):
+        connection = await aio_pika.connect_robust(self.host)
+        channel = await connection.channel()
 
-    def check_origin(self, origin):
-        return True
+        queue = await channel.declare_queue(self.queue_name)
 
+        async with queue.iterator() as queue_iter:
+            async for message in queue_iter:
+                async with message.process():
+                    # data = json.loads(message.body.decode())
+                    data = message.body.decode()
+                    await self.handle_message(data)
 
-    def do_ping(self, timestamp):
-        self.ping(str(timestamp))
+    async def handle_message(self, data):
+        print("DATA: ", data)
 
-        # ping_future = delay_future(time.time()+PING_INTERVAL, self.do_ping)
-        # loop.add_future(ping_future, lambda: None)
-
-    def on_pong(self, data):
-        pass
-
-    def rate_limited_downstream(self, message):
-        if self.downstream.do_throttle(message):
-            self.write_message(message, binary=True)
-
-    def open(self):
-        self.set_nodelay(True)
-
-    def on_message(self, message):
-        #TODO: log IP headers in the future
-
-        #Logs which user is tied to which MAC so that we detect which user is acting maliciously
-        if self.mac != message[6:12]:
+        if self.mac != data[6:12]:
             if macmap.get(self.mac, False):
                 del macmap[self.mac]
 
-            self.mac = message[6:12]
-            formatted_mac = ':'.join('{0:02x}'.format(a) for a in message[6:12]) 
-            logger.info('%s: using mac %s' % (self.remote_ip, formatted_mac))
+            self.mac = data[6:12]
 
             macmap[self.mac] = self
 
-        dest = message[0:6]
+        dest = data[0:6]
         try:
             if dest == BROADCAST or (dest[0] & 0x1) == 1:
-                if self.upstream.do_throttle(message):
+                if self.upstream.do_throttle(data):
                     for socket in macmap.values():
                         try:
-                                socket.write_message(str(message),binary=True)
+                            socket.write_message(str(data),binary=True)
                         except:
                             pass
 
-                    tunthread.write(message)
+                    tunthread.write(data)
             elif macmap.get(dest, False):
-                if self.upstream.do_throttle(message):
+                if self.upstream.do_throttle(data):
                     try:
-                        macmap[dest].write_message(str(message),binary=True)
+                        macmap[dest].write_message(str(data),binary=True)
                     except:
                         pass
             else:
-                if self.upstream.do_throttle(message):
-                    tunthread.write(message)
+                if self.upstream.do_throttle(data):
+                    tunthread.write(data)
 
         except:
             tb = traceback.format_exc()
-            logger.error('%s: error on receive. Closing\n%s' % (self.remote_ip, tb))
+            # logger.error('%s: error on receive. Closing\n%s' % (self.remote_ip, tb))
             try:
                 self.close()
             except:
                 pass
 
-    def on_close(self):
-        logger.info('%s: disconnected.' % self.remote_ip)
-
-        if self.thread is not None:
-            self.thread.running = False
-
-        try:
-            del macmap[self.mac]
-        except:
-            pass
-
-application = tornado.web.Application([(r'/', MainHandler)])
-
-if __name__ == '__main__':
+if __name__ == "__main__":
 
     tunthread = TunThread()
     tunthread.start()
- 
-    args = sys.argv
-    tornado.options.parse_command_line(args)
-    application.listen(8080)
-    loop = tornado.ioloop.IOLoop.instance()
-    try:
-        loop.start()
-    except:
-        pass
 
-    tunthread.running = False;
+    host = "amqp://localhost"
+    queue_name = "VPN"
+
+    consumer = RabbitMQConsumer(host, queue_name)
+
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(consumer.start())
+
+    tunthread.running = False
+
+
+
+# if __name__ == '__main__':
+
+#     tunthread = TunThread()
+#     tunthread.start()
+ 
+#     args = sys.argv
+#     tornado.options.parse_command_line(args)
+#     application.listen(8080)
+#     loop = tornado.ioloop.IOLoop.instance()
+#     try:
+#         loop.start()
+#     except:
+#         pass
+
+#     tunthread.running = False
 
