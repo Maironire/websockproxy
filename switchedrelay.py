@@ -29,12 +29,6 @@ logger = logging.getLogger('relay')
 
 macmap = {}
 
-async def delay_future(t, callback):
-    timestamp = time.time()
-    if timestamp < t:
-        return
-    else:
-        callback(t)
 
 class TunThread(threading.Thread):
     def __init__(self, *args, **kwargs):
@@ -56,117 +50,98 @@ class TunThread(threading.Thread):
             while(self.running):
                 pollret = p.poll(1000)
                 for (f,e) in pollret:
-                    if f == self.tun.fileno() and (e & POLLIN):
-                        buf = self.tun.read(self.tun.mtu+18)
-                        if len(buf):
-                            mac = buf[0:6]
-                            if mac == BROADCAST or (mac[0] & 0x1) == 1:
-                                for socket in macmap.values():
-                                    def send_message(socket):
-                                        try:
-                                            socket.rate_limited_downstream(buf)
-                                        except:
-                                            pass
+                    if f == self.tun.fileno() and (e & POLLIN) and len(data := self.tun.read(self.tun.mtu+18)):
+                        mac = data[0:6]
+                        if mac == BROADCAST or (mac[0] & 0x1) == 1:
+                            for client in macmap.values():
+                                loop.create_task(hiveConnection.send_message(client, data))
 
-                                    # loop.add_callback(functools.partial(send_message, socket))
-
-                            elif macmap.get(mac, False):
-                                def send_message():
-                                    try:
-                                        macmap[mac].rate_limited_downstream(buf)
-                                    except:
-                                        pass
-
-                                # loop.add_callback(send_message)
+                        elif macmap.get(mac, False):
+                            loop.create_task(hiveConnection.send_message(macmap[mac], data))
         except Exception as e:
-            raise e
             logger.error('closing due to tun error')
+            raise e
         finally:
             self.tun.close()
 
 
-class RabbitMQConsumer:
+class HiveConnection:
     def __init__(self, host, queue_name):
         self.host = host
         self.queue_name = queue_name
 
-        # self.remote_ip = self.request.headers.get('X-Forwarded-For', self.request.remote_ip)
-        self.remote_ip = '127.0.0.1'
-        logger.info('%s: connected.' % self.remote_ip)
-        self.thread = None
-        self.mac = ''
-        self.allowance = RATE
-        self.last_check = time.time()
-        self.upstream = RateLimitingState(RATE, name='upstream', clientip=self.remote_ip)
-        self.downstream = RateLimitingState(RATE, name='downstream', clientip=self.remote_ip)
+        # self.upstream = RateLimitingState(RATE, name='upstream', clientip=self.remote_ip)
+        # self.downstream = RateLimitingState(RATE, name='downstream', clientip=self.remote_ip)
 
     async def start(self):
         connection = await aio_pika.connect_robust(self.host)
         channel = await connection.channel()
 
-        queue = await channel.declare_queue(self.queue_name)
+        self.ingress_exchange = await channel.declare_exchange('ingress_eth', aio_pika.ExchangeType.DIRECT)
+        self.egress_exchange = await channel.declare_exchange('egress_eth', aio_pika.ExchangeType.FANOUT)
+        queue = await channel.declare_queue(self.queue_name, auto_delete=True)
+        await queue.bind(self.egress_exchange)
 
         async with queue.iterator() as queue_iter:
             async for message in queue_iter:
                 async with message.process():
                     # data = json.loads(message.body.decode())
                     data = message.body.decode()
-                    await self.handle_message(data)
+                    await self.receive_message(data, message.reply_to)
+                    await message.ack()
 
-    async def handle_message(self, data):
+    async def receive_message(self, data, source):
         print("DATA: ", data)
 
-        if self.mac != data[6:12]:
-            if macmap.get(self.mac, False):
-                del macmap[self.mac]
-
-            self.mac = data[6:12]
-
-            macmap[self.mac] = self
+        mac = data[6:12]
+        if mac not in macmap:
+            macmap[mac] = source
+            logger.info('%s: connected.' % source)
 
         dest = data[0:6]
         try:
             if dest == BROADCAST or (dest[0] & 0x1) == 1:
-                if self.upstream.do_throttle(data):
-                    for socket in macmap.values():
-                        try:
-                            socket.write_message(str(data),binary=True)
-                        except:
-                            pass
+                # if self.upstream.do_throttle(data):
+                    for client in macmap.values():
+                        try: self.send_message(client, data)
+                        except: pass
 
                     tunthread.write(data)
-            elif macmap.get(dest, False):
-                if self.upstream.do_throttle(data):
-                    try:
-                        macmap[dest].write_message(str(data),binary=True)
-                    except:
-                        pass
+            elif client := macmap.get(dest):
+                # if self.upstream.do_throttle(data):
+                    try: self.send_message(client, data)
+                    except: pass
             else:
-                if self.upstream.do_throttle(data):
+                # if self.upstream.do_throttle(data):
                     tunthread.write(data)
 
         except:
             tb = traceback.format_exc()
-            # logger.error('%s: error on receive. Closing\n%s' % (self.remote_ip, tb))
-            try:
-                self.close()
-            except:
-                pass
+            logger.error('%s: error on receive\n%s' % (source, tb))
+
+    async def send_message(self, target, message):
+        self.ingress_exchange.publish(message, target)
+
+    async def destroy(self):
+        await self.ingress_exchange.delete()
+        await self.egress_exchange.delete()
 
 if __name__ == "__main__":
+
+    host = "amqp://localhost"
+    queue_name = "egress_eth"
+
+    hiveConnection = HiveConnection(host, queue_name)
 
     tunthread = TunThread()
     tunthread.start()
 
-    host = "amqp://localhost"
-    queue_name = "VPN"
-
-    consumer = RabbitMQConsumer(host, queue_name)
-
     loop = asyncio.get_event_loop()
-    loop.run_until_complete(consumer.start())
+    try: loop.run_until_complete(hiveConnection.start())
+    finally:
+        tunthread.running = False
+        loop.run_until_complete(hiveConnection.destroy())
 
-    tunthread.running = False
 
 
 
