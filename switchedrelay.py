@@ -86,9 +86,9 @@ class HiveConnection:
             async for message in queue_iter:
                 async with message.process():
                     # data = json.loads(message.body.decode())
-                    data = message.body.decode()
+                    data = message.body
                     await self.receive_message(data, message.reply_to)
-                    await message.ack()
+                    # await message.ack()
 
     async def receive_message(self, data, source):
         print("DATA: ", data)
@@ -102,14 +102,15 @@ class HiveConnection:
         try:
             if dest == BROADCAST or (dest[0] & 0x1) == 1:
                 # if self.upstream.do_throttle(data):
+
                     for client in macmap.values():
-                        try: self.send_message(client, data)
+                        try: await self.send_message(client, data)
                         except: pass
 
                     tunthread.write(data)
             elif client := macmap.get(dest):
                 # if self.upstream.do_throttle(data):
-                    try: self.send_message(client, data)
+                    try: await self.send_message(client, data)
                     except: pass
             else:
                 # if self.upstream.do_throttle(data):
@@ -120,7 +121,7 @@ class HiveConnection:
             logger.error('%s: error on receive\n%s' % (source, tb))
 
     async def send_message(self, target, message):
-        self.ingress_exchange.publish(message, target)
+        await self.ingress_exchange.publish(message, target)
 
     async def destroy(self):
         await self.ingress_exchange.delete()
