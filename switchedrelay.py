@@ -91,7 +91,7 @@ class HiveConnection:
                     # await message.ack()
 
     async def receive_message(self, data, source):
-        print("DATA: ", data)
+        # print("TX: ", data)
 
         mac = data[6:12]
         if mac not in macmap:
@@ -121,7 +121,9 @@ class HiveConnection:
             logger.error('%s: error on receive\n%s' % (source, tb))
 
     async def send_message(self, target, message):
-        await self.ingress_exchange.publish(message, target)
+        # print("RX: ", message)
+        # print("TO:", target)
+        await self.ingress_exchange.publish(aio_pika.Message(message), target)
 
     async def destroy(self):
         await self.ingress_exchange.delete()
