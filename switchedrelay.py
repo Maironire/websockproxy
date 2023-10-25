@@ -15,6 +15,7 @@ from limiter import RateLimitingState
 
 import asyncio
 import aio_pika
+import pika
 
 import json
 
@@ -44,6 +45,8 @@ class TunThread(threading.Thread):
         self.tun.write(message)
 
     def run(self):
+        connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
+        channel = connection.channel()
         p = poll()
         p.register(self.tun, POLLIN)
         try:
@@ -54,10 +57,11 @@ class TunThread(threading.Thread):
                         mac = data[0:6]
                         if mac == BROADCAST or (mac[0] & 0x1) == 1:
                             for client in macmap.values():
-                                loop.create_task(hiveConnection.send_message(client, data))
+                                channel.basic_publish('ingress_eth', client, data)
 
                         elif macmap.get(mac, False):
-                            loop.create_task(hiveConnection.send_message(macmap[mac], data))
+                            channel.basic_publish('ingress_eth', macmap[mac], data)
+                connection.process_data_events()
         except Exception as e:
             logger.error('closing due to tun error')
             raise e
