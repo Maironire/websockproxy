@@ -30,6 +30,10 @@ logger = logging.getLogger('relay')
 
 macmap = {}
 
+def format_rate(bytesCount, interval):
+    if bytesCount > 2**17: return f"{bytesCount / interval / 2**20 * 8:.1f} Mbit/sec"
+    elif bytesCount > 2**7: return f"{bytesCount /interval / 2**10 * 8:.1f} Kbit/sec"
+    else: return f"{bytesCount:.1f} bit/sec"
 
 class TunThread(threading.Thread):
     def __init__(self, *args, **kwargs):
@@ -40,15 +44,19 @@ class TunThread(threading.Thread):
         self.tun.netmask = '255.255.0.0'
         self.tun.mtu = 1500
         self.tun.up()
+        self.ingressBytes = 0
+        self.egressBytes = 0
 
-    def write(self, message):
-        self.tun.write(message)
+    def write(self, data):
+        self.tun.write(data)
+        self.egressBytes += len(data)
 
     def run(self):
         connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
         channel = connection.channel()
         p = poll()
         p.register(self.tun, POLLIN)
+        reportTimestamp = time.time()
         try:
             while(self.running):
                 pollret = p.poll(1000)
@@ -58,10 +66,16 @@ class TunThread(threading.Thread):
                         if mac == BROADCAST or (mac[0] & 0x1) == 1:
                             for client in macmap.values():
                                 channel.basic_publish('ingress_eth', client, data)
+                                self.ingressBytes += len(data)
 
                         elif macmap.get(mac, False):
                             channel.basic_publish('ingress_eth', macmap[mac], data)
+                            self.ingressBytes += len(data)
                 connection.process_data_events()
+                if (delta := time.time() - reportTimestamp) > 0.5:
+                    print(f"\rTX: {format_rate(self.egressBytes, delta):<15} RX: {format_rate(self.ingressBytes, delta):<15}", end='')
+                    self.egressBytes = self.ingressBytes = 0
+                    reportTimestamp = time.time()
         except Exception as e:
             logger.error('closing due to tun error')
             raise e
@@ -124,10 +138,10 @@ class HiveConnection:
             tb = traceback.format_exc()
             logger.error('%s: error on receive\n%s' % (source, tb))
 
-    async def send_message(self, target, message):
-        # print("RX: ", message)
+    async def send_message(self, target, data):
+        # print("RX: ", data)
         # print("TO:", target)
-        await self.ingress_exchange.publish(aio_pika.Message(message), target)
+        await self.ingress_exchange.publish(aio_pika.Message(data), target)
 
     async def destroy(self):
         await self.ingress_exchange.delete()
